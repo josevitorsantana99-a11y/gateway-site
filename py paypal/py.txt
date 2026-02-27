@@ -1,0 +1,119 @@
+from flask import Flask, render_template, redirect
+import requests
+import base64
+import os
+import sqlite3
+
+app = Flask(__name__)
+
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
+PAYPAL_SECRET = os.getenv("PAYPAL_SECRET")
+PAYPAL_BASE = "https://api-m.sandbox.paypal.com"
+
+# ===== DATABASE =====
+def init_db():
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT,
+            status TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def save(order_id, status):
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO transactions (order_id, status) VALUES (?, ?)",
+              (order_id, status))
+    conn.commit()
+    conn.close()
+
+def token():
+    auth = base64.b64encode(f"{PAYPAL_CLIENT_ID}:{PAYPAL_SECRET}".encode()).decode()
+
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+
+    data = {"grant_type": "client_credentials"}
+
+    r = requests.post(f"{PAYPAL_BASE}/v1/oauth2/token", headers=headers, data=data)
+    return r.json()["access_token"]
+
+@app.route("/")
+def home():
+    return """
+    <h1>Gateway Test</h1>
+    <form action='/pay' method='post'>
+        <button type='submit'>Test Payment</button>
+    </form>
+    <a href='/dashboard'>Dashboard</a>
+    """
+
+@app.route("/pay", methods=["POST"])
+def pay():
+    access = token()
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access}"
+    }
+
+    data = {
+        "intent": "CAPTURE",
+        "purchase_units": [{
+            "amount": {
+                "currency_code": "USD",
+                "value": "10.00"
+            }
+        }]
+    }
+
+    create = requests.post(f"{PAYPAL_BASE}/v2/checkout/orders", json=data, headers=headers).json()
+    order_id = create.get("id")
+
+    capture = requests.post(f"{PAYPAL_BASE}/v2/checkout/orders/{order_id}/capture", headers=headers).json()
+    status = capture.get("status", "FAILED")
+
+    if status == "COMPLETED":
+        save(order_id, "APPROVED")
+    else:
+        save(order_id, "FAILED")
+
+    return redirect("/dashboard")
+
+@app.route("/dashboard")
+def dashboard():
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM transactions WHERE status='APPROVED'")
+    approved = c.fetchall()
+
+    c.execute("SELECT * FROM transactions WHERE status='FAILED'")
+    failed = c.fetchall()
+
+    conn.close()
+
+    html = "<h1>Approved</h1>"
+    for t in approved:
+        html += f"<p>{t[1]}</p>"
+
+    html += "<h1>Failed</h1>"
+    for t in failed:
+        html += f"<p>{t[1]}</p>"
+
+    html += "<br><a href='/'>Back</a>"
+
+    return html
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
